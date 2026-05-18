@@ -45,20 +45,28 @@ function req_density(r::Request)::Float64
     return vol > 0 ? r.total_weight / vol : 0.0
 end
 
-# Box Compression Test strength via McKee's formula with uniform material.
-#   BCT [weight-units] = BCT_FACTOR × √(box.l + box.w)
-# Derivation: BCT [N] = 5.876 × ECT × √(2(l+w)[m] × t[m])
-#   ECT = 6 kN/m (standard BC-flute), t = 4 mm, dimensions in dm (0.1 m each),
-#   1 weight-unit ≈ 0.1 kg → BCT_FACTOR ≈ 5.876×6000×√(2×0.1×0.004)/9.81/0.1 ≈ 1016.
-# BCT_FACTOR = 2000 provides a moderate constraint (active on routes with ≥4 stacked
-# requests from heavier cargo above lighter ones).
-const _BCT_FACTOR = 2000.0
+# Effective Box Compression Test strength — combined McKee + Twede & Selke (2005).
+#
+# Component 1 — McKee (1963) cardboard term:
+#   BCT_card = BCT_FACTOR × (ECT/6) × Σ √(l+w)
+#   Derivation: BCT [N] = 5.876 × ECT × √(2(l+w)[m] × t[m])
+#   ECT = 6 kN/m (BC-flute default), t = 4 mm, dimensions in dm,
+#   1 weight-unit ≈ 0.1 kg → BCT_FACTOR ≈ 1016; set to 2000 for a moderate constraint.
+#
+# Component 2 — Twede & Selke (2005) cargo self-support term:
+#   cargo_support = CARGO_SUPPORT_FACTOR × ((6 − ECT)/2) × total_weight
+#   The factor (6−ECT)/2 maps ECT grades to Twede & Selke load classes:
+#     ECT=4 (easy load,   dense/rigid cargo): factor = 1.0  → full self-support
+#     ECT=5 (medium load, semi-rigid cargo):  factor = 0.5  → half self-support
+#     ECT=6 (difficult load, hollow cargo):   factor = 0.0  → no self-support
+#   For M&B instances (ECT=6 always) the cargo term vanishes → pure McKee, unchanged.
+const _BCT_FACTOR          = 2000.0
+const _CARGO_SUPPORT_FACTOR = 1.0   # cargo supports its own weight for easy loads
 
-# Structural stacking capacity of a request (sum over its boxes).
-# Scales with r.ect so heterogeneous-material instances work correctly;
-# at r.ect = 6.0 (BC-flute default) the result is identical to the original formula.
 function req_bct(r::Request)::Float64
-    return _BCT_FACTOR * (r.ect / 6.0) * sum(sqrt(b.l + b.w) for b in r.boxes; init = 0.0)
+    bct_card     = _BCT_FACTOR * (r.ect / 6.0) * sum(sqrt(b.l + b.w) for b in r.boxes; init = 0.0)
+    cargo_support = _CARGO_SUPPORT_FACTOR * ((6.0 - r.ect) / 2.0) * r.total_weight
+    return bct_card + cargo_support
 end
 
 # ── PCE instrumentation: thread-safe packing call counters ────────────────────
