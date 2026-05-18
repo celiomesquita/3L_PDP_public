@@ -363,11 +363,11 @@ function write_detailed(results, density, ss, out_path)
 end
 
 # ── write results_hetero.tex ──────────────────────────────────────────────────
-# Compares 3L-PDP, 3L-PDP-D, and 3L-PDP-S on the synthetic heterogeneous
+# Compares 3L-PDP-H, 3L-PDP-D, and 3L-PDP-C on the synthetic heterogeneous
 # instances (3L_PDP_instances_hetero/).  No M&B V4 reference exists for these
-# instances; the gap (ΔBase) is relative to the 3L-PDP baseline.
-# The Win D/S column counts how many instances within the class are won by
-# PC5 (D) vs PC6 (S), the key metric showing divergence from the near-tie
+# instances; the gap (ΔBase) is relative to the 3L-PDP-H baseline.
+# The Win D/C column counts how many instances within the class are won by
+# PC5 (D) vs PC7 (C), the key metric showing divergence from the near-tie
 # observed on the M&B benchmark.
 function write_hetero_summary(base, density, ss, out_path)
     sizes   = [50, 75, 100]
@@ -391,10 +391,10 @@ function write_hetero_summary(base, density, ss, out_path)
         println(io, raw"\multirow{2}{*}{$n$} & \multirow{2}{*}{Class}")
         println(io, raw"  & \multirow{2}{*}{$|\mathcal{H}|$}")
         println(io, raw"  & \multirow{2}{*}{3L-PDP-H}")
-        println(io, raw"  & \multicolumn{2}{c}{3L-PDP-D} & \multicolumn{2}{c}{3L-PDP-S}")
+        println(io, raw"  & \multicolumn{2}{c}{3L-PDP-D} & \multicolumn{2}{c}{3L-PDP-C}")
         println(io, raw"  & Win \\\\")
         println(io, raw"\cmidrule(lr){5-6}\cmidrule(lr){7-8}")
-        println(io, raw" & & & & Avg & $\Delta$Base & Avg & $\Delta$Base & D\,/\,S \\\\")
+        println(io, raw" & & & & Avg & $\Delta$Base & Avg & $\Delta$Base & D\,/\,C \\\\")
         println(io, raw"\midrule")
 
         for size in sizes
