@@ -1,165 +1,120 @@
-# 3L-PDP: Polynomial-Time Packing Oracle with Practical Stacking Constraints
+# 3L-PDP — experiment reproduction package
 
-Source code and heterogeneous benchmark instances for the paper
-*"A polynomial-time packing oracle for the three-dimensional loading
-pickup-and-delivery problem with practical stacking constraints"*
-(under review, 2026).
+Anonymous source code and benchmark data to reproduce the computational experiments  
+for a manuscript on real-time certified routing for the Three-Dimensional Loading  
+Pickup and Delivery Problem (3L-PDP). Under double-blind review (2026).
 
 ---
 
-## Repository contents
+## Contents
 
 ```
-├── src/                        Julia source code
-│   ├── main.jl                 Single-instance entry point (MIP / BRKGA / ALNS)
-│   ├── brkga.jl                Parallel BRKGA solver
-│   ├── alns.jl                 ALNS solver (ablation vehicle)
-│   ├── packing.jl              3C-SP packing oracle
-│   ├── model.jl                MIP formulation (HiGHS / JuMP)
-│   ├── run_benchmark_parallel.jl  Per-worker benchmark runner
-│   ├── launch_parallel_benchmark.sh  Parallel benchmark launcher
-│   ├── gen_hetero_instances.jl  Heterogeneous instance generator
-│   ├── gen_tables.jl           LaTeX table generator
-│   ├── ablation_3csp.jl        Oracle depth ablation study
-│   ├── measure_wpl.jl          Worst-Case Packing Latency (WPL) measurement
-│   └── ...                     Analysis and utility scripts
-└── instances_hetero/           270 heterogeneous benchmark instances (3L-PDP-H)
-    └── README.md               Instance format and generation details
+├── Project.toml / Manifest.toml     Julia environment
+├── 3L_PDP_instances/                54 M&B benchmark instances
+├── 3L_PDP_instances_hetero/         270 synthetic heterogeneous instances
+├── src/                             Solvers and experiment drivers
+└── scripts/                         Batch launchers (Windows PowerShell)
 ```
+
+All experiment outputs are written to `results/` at runtime (not shipped with this repository).
 
 ---
 
 ## Requirements
 
-- **Julia 1.12** or later
-- Julia packages (installed automatically via `Project.toml`):
-  - `BrkgaMpIpr` — parallel BRKGA framework
-  - `JuMP` + `HiGHS` — MIP exact solver
-  - `MHLib` — metaheuristic utilities
+- **Julia 1.12+**
+- Packages: `BrkgaMpIpr`, `JuMP`, `HiGHS`, `MHLib` (via `Project.toml`)
 
-Install dependencies from the project root:
-
-```bash
+```powershell
 julia --project=. -e "using Pkg; Pkg.instantiate()"
 ```
 
----
+**Reference hardware** (paper §5): Intel Core Ultra 7 155H, 64 GiB RAM, Windows 11,  
+memetic solver `--threads 18,2` (18 BRKGA + 2 ALNS/control threads), **300 s** per run,  
+solver seeds **1–5** on M&B, seed **1** on heterogeneous instances.
 
-## M&B benchmark instances
-
-The 54 benchmark instances of Männel & Bortfeldt (2016, 2018) are **not
-included** in this repository. They are available from the authors upon
-request (see the original paper) or from the Electronic Companion of:
-
-> Männel, D., & Bortfeldt, A. (2016). A hybrid algorithm for the vehicle
-> routing problem with pickup and delivery and three-dimensional loading
-> constraints. *European Journal of Operational Research*, 254(3), 840–858.
-
-Place the downloaded instances in a directory named `3L_PDP_instances/`
-at the project root before running any benchmark.
+Adjust thread counts to your machine; keep the time limit and seed lists unchanged for comparison.
 
 ---
 
-## Quick start — single instance
+## Experiment map
 
-```bash
-# Run BRKGA on one M&B instance (300 s, all threads):
-julia --project=. --threads auto src/main.jl brkga 050_CLUS_2_1.txt
+| Study | Command | Primary output |
+|-------|---------|----------------|
+| Metaheuristic pilot (6 inst. × 3 seeds) | `.\scripts\launch_metaheuristic_comparison.ps1` | `results/metaheuristic_comparison.csv` |
+| M&B memetic benchmark (54 × 5 × 3 variants) | `.\scripts\launch_memetic_table2.ps1` | `results/memetic_benchmark_3lpdp*.csv` |
+| Hetero policies PC5 / PC7 (270 × 1 seed) | `.\scripts\launch_memetic_hetero.ps1` | `results/memetic_benchmark_3lpdp_h.csv`, `_d_h.csv`, `_c.csv` |
+| WPL latency | `julia --project=. src/measure_wpl.jl` | `results/wpl_results.csv` |
+| Oracle completeness | `julia --project=. src/run_oracle_completeness_study.jl` | `results/oracle_completeness.csv` |
+| Memetic oracle panel | `julia --threads 18,2 --project=. src/run_memetic_oracle_panel.jl 300 1` | `results/memetic_oracle_panel.csv` |
+| MIP formulation check ($n{=}4$) | `julia --project=. src/main.jl mip 050_CLUS_2_1.txt 1 4` | stdout (optimal ≈ 258.28) |
+| Summaries | `julia --project=. src/gen_tables.jl` | `results/tables/*.txt` |
 
-# Run ALNS on a larger instance:
-julia --project=. src/main.jl alns 075_RAND_2_1.txt
-
-# Validate MIP exact solution on a small subset (n ≤ 4 requests):
-julia --project=. src/main.jl mip 050_CLUS_2_1.txt 1 4
-```
-
----
-
-## Full benchmark — parallel execution
-
-The parallel launcher distributes the full (instance × seed) matrix across
-`N_WORKERS` Julia processes.  Each worker writes its own CSV; the launcher
-merges them into `results/results.csv`.
-
-```bash
-# Defaults: brkga, 300 s per run, 5 seeds, 15 workers
-bash src/launch_parallel_benchmark.sh
-
-# Custom: alns, 120 s, 3 seeds, 8 workers
-bash src/launch_parallel_benchmark.sh alns 120 3 8
-```
-
-The launcher expects `julia` to be on your `PATH`.  If it is not, set the
-`JULIA` variable at the top of `src/launch_parallel_benchmark.sh` to the
-full path of your Julia executable.
-
-Results are written to `results/results.csv`.
-Run `julia --project=. src/gen_tables.jl` afterwards to regenerate the
-LaTeX tables.
+All memetic drivers **resume** from existing CSV rows after interruption.
 
 ---
 
-## Heterogeneous benchmark (3L-PDP-H)
+## Quick start
 
-The 270 instances in `instances_hetero/` are synthetic heterogeneous
-variants of the 54 M&B instances.  Each base instance is perturbed with
-5 random seeds (H1–H5), independently randomising per-request volumetric
-density and ECT (edge-crush resistance) grade to break the
-weight–volume correlation present in the M&B benchmark.
+```powershell
+# Dependencies
+julia --project=. -e "using Pkg; Pkg.instantiate()"
 
-See [`instances_hetero/README.md`](instances_hetero/README.md) for the
-full generation procedure and file format.
+# Sanity check — one instance, 60 s
+julia --threads 4,1 --project=. src/run_memetic_benchmark.jl 60 1 3lpdp 050_CLUS_2_1.txt results/smoke.csv
 
-To regenerate the instances from the M&B base files:
+# Full M&B table (long run)
+.\scripts\launch_memetic_table2.ps1
 
-```bash
-julia --project=. src/gen_hetero_instances.jl
-```
-
-To run BRKGA on the heterogeneous benchmark:
-
-```bash
-bash src/launch_parallel_benchmark.sh brkga 300 1 8 0 0 instances_hetero
+# Summarize completed runs
+julia --project=. src/gen_tables.jl
 ```
 
 ---
 
 ## Stacking variants
 
-Two operational stacking constraints can be activated via flags passed to
-the benchmark runner:
+Third argument to `run_memetic_benchmark.jl`:
 
-| Flag | Variant | Constraint |
-|------|---------|------------|
-| `use_density=1` | 3L-PDP-D (PC5) | Non-decreasing volumetric density in delivery order |
-| `use_ss=1`      | 3L-PDP-S (PC6) | Cumulative compressive load ≤ BCT strength (McKee's formula) |
+| Variant | Policy |
+|---------|--------|
+| `3lpdp` / `3lpdp_h` | Baseline (PC1–PC4) |
+| `3lpdp_d` | Density ordering (PC5) |
+| `3lpdp_s` | McKee BCT stacking (PC6) |
+| `3lpdp_c` | Combined McKee + Twede model (PC7) |
 
-Example — run PC6 on the heterogeneous benchmark:
+Hetero instances: append ECT per request; see `3L_PDP_instances_hetero/README.md`.
 
-```bash
-bash src/launch_parallel_benchmark.sh brkga 300 1 8 0 1 instances_hetero
+Regenerate hetero set from M&B bases:
+
+```powershell
+julia --project=. src/gen_hetero_instances.jl
 ```
 
 ---
 
-## Citation
+## Expected outcomes (full rerun)
 
-If you use this code or the 3L-PDP-H instances, please cite:
+After completing the benchmark scripts, `gen_tables.jl` should report approximately:
 
-```
-Anonymous (2026). A polynomial-time packing oracle for the
-three-dimensional loading pickup-and-delivery problem with practical
-stacking constraints. Under review.
-```
+- Mean ΔV4 vs. M&B (2018) V4: **+7.85%** (95% CI **+5.89% to +9.81%**, 54 instances)
+- Hetero mean ΔBase: PC5 **+2.79%**, PC7 **+0.96%**
+- Table I memetic pilot: mean TTD **≈ 1379.75**, ΔV4 **≈ +3.65%**
 
-and the original M&B benchmark:
+---
 
-```
-Männel, D., & Bortfeldt, A. (2016). A hybrid algorithm for the vehicle
-routing problem with pickup and delivery and three-dimensional loading
-constraints. European Journal of Operational Research, 254(3), 840–858.
+## External data citation
 
-Männel, D., & Bortfeldt, A. (2018). Solving the three-dimensional loading
-vehicle routing problem with pickup and delivery. Transportation Science,
-53(3), 840–864.
-```
+The 54 M&B instances are from:
+
+> Männel, D., & Bortfeldt, A. (2016). *European Journal of Operational Research*, 254(3), 840–858.  
+> Männel, D., & Bortfeldt, A. (2018). *Transportation Science*, 53(3), 840–864.
+
+The 270 heterogeneous instances are synthetic derivatives distributed with this repository.
+
+---
+
+## Launcher notes
+
+- Run PowerShell scripts from the **repository root**: `.\scripts\launch_*.ps1`
+- Set `JULIA` if `julia` is not on PATH: `$env:JULIA = "C:\Path\To\julia.exe"`

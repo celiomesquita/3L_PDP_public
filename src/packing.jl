@@ -60,12 +60,12 @@ end
 #     ECT=5 (medium load, semi-rigid cargo):  factor = 0.5  → half self-support
 #     ECT=6 (difficult load, hollow cargo):   factor = 0.0  → no self-support
 #   For M&B instances (ECT=6 always) the cargo term vanishes → pure McKee, unchanged.
-const _BCT_FACTOR          = 2000.0
-const _CARGO_SUPPORT_FACTOR = 1.0   # cargo supports its own weight for easy loads
+@isdefined(_BCT_FACTOR)           || const _BCT_FACTOR           = Ref(2000.0)
+@isdefined(_CARGO_SUPPORT_FACTOR) || const _CARGO_SUPPORT_FACTOR = Ref(1.0)
 
 function req_bct(r::Request)::Float64
-    bct_card     = _BCT_FACTOR * (r.ect / 6.0) * sum(sqrt(b.l + b.w) for b in r.boxes; init = 0.0)
-    cargo_support = _CARGO_SUPPORT_FACTOR * ((6.0 - r.ect) / 2.0) * r.total_weight
+    bct_card     = _BCT_FACTOR[] * (r.ect / 6.0) * sum(sqrt(b.l + b.w) for b in r.boxes; init = 0.0)
+    cargo_support = _CARGO_SUPPORT_FACTOR[] * ((6.0 - r.ect) / 2.0) * r.total_weight
     return bct_card + cargo_support
 end
 
@@ -97,50 +97,58 @@ boxes cannot fit.
 function _pack_2d_height(boxes::AbstractVector{Box}, Wv::Int, Hv::Int)::Int
     isempty(boxes) && return 0
 
-    non_frag = sort([b for b in boxes if !b.fragile]; by = b -> b.h, rev = true)
-    frag     = sort([b for b in boxes if  b.fragile]; by = b -> b.h, rev = true)
-
-    # Shelf list: (shelf_height::Int, width_used::Int)
-    shelves = Tuple{Int,Int}[]
-
-    # --- place non-fragile items via FFD ---
-    for b in non_frag
+    function shelf_ffd_height(candidates::Vector{Box}, height_limit::Int)::Int
+        sorted = sort(candidates; by = b -> b.h, rev = true)
+        shelves = Tuple{Int,Int}[]
         placed = false
-        for i in eachindex(shelves)
-            sh_h, sh_w = shelves[i]
-            if b.h <= sh_h && sh_w + b.w <= Wv
-                shelves[i] = (sh_h, sh_w + b.w)
-                placed = true
-                break
+        for b in sorted
+            placed = false
+            for i in eachindex(shelves)
+                sh_h, sh_w = shelves[i]
+                if b.h <= sh_h && sh_w + b.w <= Wv
+                    shelves[i] = (sh_h, sh_w + b.w)
+                    placed = true
+                    break
+                end
+            end
+            if !placed
+                (b.w > Wv || b.h > height_limit) && return _PACK_INF
+                push!(shelves, (b.h, b.w))
             end
         end
-        if !placed
-            b.w > Wv && return _PACK_INF
-            push!(shelves, (b.h, b.w))
-        end
+        total_h = sum(s[1] for s in shelves; init = 0)
+        return total_h <= height_limit ? total_h : _PACK_INF
     end
 
-    # --- place fragile items in dedicated topmost shelf(ves) (PC3) ---
-    if !isempty(frag)
-        frag[1].w > Wv && return _PACK_INF
-        f_h = frag[1].h
-        f_w = frag[1].w
-        for b in frag[2:end]
-            if f_w + b.w <= Wv
-                f_h = max(f_h, b.h)
-                f_w += b.w
+    non_frag = [b for b in boxes if !b.fragile]
+    frag     = [b for b in boxes if  b.fragile]
+
+    isempty(frag) && return shelf_ffd_height(non_frag, Hv)
+
+    # Fragile boxes must be on a top shelf. Non-fragile boxes may share that
+    # same shelf side-by-side, because no item is physically above them there.
+    frag_w = sum(b.w for b in frag; init = 0)
+    frag_h = maximum(b.h for b in frag)
+    (frag_w > Wv || frag_h > Hv) && return _PACK_INF
+
+    best = _PACK_INF
+    top_candidates = sort(non_frag; by = b -> b.h, rev = true)
+    for top_h in unique(sort([frag_h; [b.h for b in non_frag if b.h >= frag_h]; Hv]))
+        top_w = frag_w
+        lower = Box[]
+        for b in top_candidates
+            if b.h <= top_h && top_w + b.w <= Wv
+                top_w += b.w
             else
-                push!(shelves, (f_h, f_w))
-                b.w > Wv && return _PACK_INF
-                f_h = b.h
-                f_w = b.w
+                push!(lower, b)
             end
         end
-        push!(shelves, (f_h, f_w))
+        lower_h = shelf_ffd_height(lower, Hv - top_h)
+        lower_h == _PACK_INF && continue
+        best = min(best, top_h + lower_h)
     end
 
-    total_h = sum(s[1] for s in shelves; init = 0)
-    return total_h <= Hv ? total_h : _PACK_INF
+    return best <= Hv ? best : _PACK_INF
 end
 
 # ── layer builder: partition boxes into a-axis slabs ─────────────────────────
@@ -185,7 +193,7 @@ function _make_layers(boxes::AbstractVector{Box},
         end
     end
 
-    # ── Shims pass ─────────────────────────────────────────────────────────
+    # ── Layer consolidation pass ───────────────────────────────────────────
     # Layers are in depth-descending order (layers[1] deepest, layers[end]
     # shallowest).  Starting from the shallowest layer, try to absorb it into
     # any deeper layer: all its boxes already satisfy the depth constraint

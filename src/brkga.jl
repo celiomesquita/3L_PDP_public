@@ -7,8 +7,9 @@
 #       genes 2n+1..3n  → vehicle assignment (maps request r to vehicle k)
 #   - Decoder: chromosome → interleaved PDP routes (pickup before delivery,
 #              arbitrary interleaving otherwise) → packing check → penalised cost
-#   - Packing: only the PEAK co-loading state on each route is checked; requests
-#              in that state are passed to pack_route in their delivery order.
+#   - Packing: the PEAK-BY-VOLUME co-loading state is checked (the state where the
+#              most cargo volume is loaded simultaneously); if it fails, all k! orderings
+#              (k≤5) or O(k²) transpositions are tried (delivery-order repair).
 #   - Fitness:  F = TravelCost + ω × unplaced_items   (minimise)
 #   - Parallel evaluation: BrkgaMpIpr calls the decoder; thread-safety is
 #     guaranteed because each call allocates all working state locally.
@@ -24,16 +25,23 @@ include("utils.jl")
 include("packing.jl")
 
 # ── constants ─────────────────────────────────────────────────────────────────
-const PENALTY_WEIGHT = 1e6   # ω: penalty per unplaced item  (>> max travel cost)
+const PENALTY_WEIGHT       = 1e6  # ω: penalty per unplaced item  (>> max travel cost)
+const MAX_REPAIR_PERMUTE   = 5    # try all k! delivery orderings for peak loads ≤ this
+const GAP_PENALTY          = Ref(7.0)  # ω_gap: penalty per unit of (d_rank - p_rank) summed over requests
+#
+# Chromosome layout  (3n genes in [0,1)):
+#   genes      1 ..  n   pickup  rank of request r  (position in vehicle sequence)
+#   genes   n+1 .. 2n   delivery rank of request r  (clamped > pickup rank)
+#   genes  2n+1 .. 3n   vehicle assignment  (maps r → vehicle k)
 
 # ── BRKGA hyper-parameters (tunable) ─────────────────────────────────────────
-const POP_SIZE         = 256    # population size P
+const POP_SIZE         = 96     # population size P
 const ELITE_PCT        = 0.20   # fraction of elite individuals
 const MUTANTS_PCT      = 0.15   # fraction of mutants per generation
 const NUM_ELITE_PAR    = 1      # elite parents per crossover
 const TOTAL_PARENTS    = 2      # total parents per crossover
 const BIAS             = LOGINVERSE  # gene-inheritance bias toward elite parent
-const N_POPULATIONS    = 1      # independent sub-populations
+const N_POPULATIONS    = Ref(1) # independent sub-populations
 const MAX_GENERATIONS  = 100_000  # large; time_limit (300 s) is the effective stop
 const SEED             = 42
 
@@ -88,25 +96,70 @@ function _nn_tour(reqs::Vector{Int}, n::Int, C::Matrix{Float64})::Vector{Int}
     return route
 end
 
+# ── delivery-order repair ─────────────────────────────────────────────────────
+# Heap's algorithm: generate all permutations of arr[1..k] and test each with
+# pack_route.  Returns true as soon as a feasible ordering is found (early exit).
+function _try_perms!(arr::Vector{Int}, k::Int, inst::Instance)::Bool
+    if k == 1
+        return pack_route(arr, inst) == 0
+    end
+    _try_perms!(arr, k - 1, inst) && return true
+    for i in 1:k-1
+        if iseven(k)
+            arr[i], arr[k] = arr[k], arr[i]
+        else
+            arr[1], arr[k] = arr[k], arr[1]
+        end
+        _try_perms!(arr, k - 1, inst) && return true
+    end
+    return false
+end
+
+"""
+    _repair_pack(reqs, inst) -> Int
+
+Try to find any delivery ordering of `reqs` that `pack_route` accepts.
+For peak loads ≤ MAX_REPAIR_PERMUTE tries all k! orderings (Heap's algorithm).
+For larger peaks tries all O(k²) single transpositions and the reverse order.
+Returns 0 if a feasible ordering exists, otherwise total box count (penalty proxy).
+"""
+function _repair_pack(reqs::Vector{Int}, inst::Instance)::Int
+    isempty(reqs) && return 0
+    k     = length(reqs)
+    n_box = sum(length(inst.requests[r].boxes) for r in reqs)
+    arr   = copy(reqs)
+
+    if k <= MAX_REPAIR_PERMUTE
+        _try_perms!(arr, k, inst) && return 0
+    else
+        for i in 1:k, j in i+1:k
+            arr[i], arr[j] = arr[j], arr[i]
+            pack_route(arr, inst) == 0 && return 0
+            arr[i], arr[j] = arr[j], arr[i]
+        end
+        reverse!(arr)
+        pack_route(arr, inst) == 0 && return 0
+    end
+    return n_box
+end
+
 # ── decoder ───────────────────────────────────────────────────────────────────
 """
     decode!(chromosome, pdp_inst, rewrite) -> Float64
 
-Map a chromosome to a 3L-PDP solution and return its fitness (travel cost +
-penalty for packing violations).
+Map a 3n-gene chromosome to a 3L-PDP solution and return its fitness.
 
-Chromosome layout (n genes):
-  gene r  — vehicle assignment for request r  (maps to vehicle min(K, ⌊K·gene⌋+1))
+Chromosome layout:
+  genes      1..n   pickup  ranks  → position of pickup  event in vehicle sequence
+  genes   n+1..2n   delivery ranks → position of delivery event (clamped > pickup)
+  genes  2n+1..3n   vehicle assignment → request r goes to vehicle k
 
-Route construction: for each vehicle, a nearest-neighbour tour is built over
-its assigned requests, respecting pickup-before-delivery precedence.  NN
-routing produces much shorter routes than random-rank ordering and allows the
-BRKGA to focus its evolution on vehicle assignment (the high-level clustering
-decision) rather than wasting budget on low-level node orderings.
+Route construction: for each vehicle the pickup and delivery events are sorted
+by their rank genes, giving an interleaved PDP sequence with p_r ≺ d_r guaranteed.
 
-Packing: the peak co-loading state on each vehicle is checked; requests in
-that state are passed to pack_route sorted by delivery order.  All working
-state is allocated locally so the function is thread-safe.
+Packing: the peak co-loading state is checked with pack_route in the chromosome's
+delivery order.  If that fails, _repair_pack tries alternative orderings before
+counting a penalty.  All working state is allocated locally (thread-safe).
 """
 function decode!(chromosome::Array{Float64,1},
                  pdp_inst::PDPInstance,
@@ -117,24 +170,43 @@ function decode!(chromosome::Array{Float64,1},
     K    = pdp_inst.K
     C    = pdp_inst.dist   # (2n+1)×(2n+1), index 1=depot, 2..n+1=pickups
 
-    # ── step 1: assign requests to vehicles ──────────────────────────────────
+    # ── step 1: assign requests to vehicles (genes 2n+1..3n) ─────────────────
     veh_reqs = [Int[] for _ in 1:K]
     for r in 1:n
-        k = min(K, floor(Int, chromosome[r] * K) + 1)
+        k = min(K, floor(Int, chromosome[2n + r] * K) + 1)
         push!(veh_reqs[k], r)
     end
 
     travel_cost = 0.0
     unplaced    = 0
+    gap_sum     = 0.0
+
+    for r in 1:n
+        p_rank = chromosome[r]
+        d_rank = chromosome[n + r]
+        d_rank = d_rank > p_rank ? d_rank : p_rank + 1e-9
+        gap_sum += d_rank - p_rank
+    end
 
     for k in 1:K
         reqs = veh_reqs[k]
         isempty(reqs) && continue
 
-        # ── step 2: build route via nearest-neighbour ─────────────────────
-        route = _nn_tour(reqs, n, C)
+        # ── step 2: build interleaved route from rank genes ───────────────────
+        # genes 1..n = pickup rank, genes n+1..2n = delivery rank (clamped)
+        events = Vector{Tuple{Float64,Bool,Int}}(undef, 2 * length(reqs))
+        idx = 0
+        for r in reqs
+            p_rank = chromosome[r]
+            d_rank = chromosome[n + r]
+            d_rank = d_rank > p_rank ? d_rank : p_rank + 1e-9
+            idx += 1; events[idx] = (p_rank, false, r)
+            idx += 1; events[idx] = (d_rank, true,  r)
+        end
+        sort!(events; by = x -> x[1])
+        route = [is_del ? -r : r for (_, is_del, r) in events]
 
-        # ── step 3: travel cost ───────────────────────────────────────────
+        # ── step 3: travel cost ───────────────────────────────────────────────
         prev = 1
         for v in route
             next = v > 0 ? v + 1 : -v + n + 1
@@ -143,7 +215,84 @@ function decode!(chromosome::Array{Float64,1},
         end
         travel_cost += C[prev, 1]
 
-        # ── step 4: packing feasibility of peak co-loading state ─────────
+        # ── step 4: packing feasibility at peak-by-volume state ─────────────────
+        # Selects the co-loading state with maximum loaded volume (not max count).
+        # More correct than peak-by-count: catches volume-overflow cases while
+        # keeping O(1) packing calls per vehicle so BRKGA remains navigable.
+        delivery_pos = Dict{Int,Int}()
+        for (pos, v) in enumerate(route)
+            v < 0 && (delivery_pos[-v] = pos)
+        end
+
+        loaded       = Int[]
+        peak_loaded  = Int[]
+        peak_vol     = 0
+        loaded_vol   = 0
+        req_vols_loc = [sum(b.l * b.w * b.h for b in inst.requests[r].boxes)
+                        for r in 1:length(inst.requests)]
+        for v in route
+            if v > 0
+                push!(loaded, v)
+                loaded_vol += req_vols_loc[v]
+                if loaded_vol > peak_vol
+                    peak_vol    = loaded_vol
+                    peak_loaded = copy(loaded)
+                end
+            else
+                loaded_vol -= req_vols_loc[-v]
+                filter!(x -> x != -v, loaded)
+            end
+        end
+
+        sort!(peak_loaded; by = r -> delivery_pos[r])
+        pen = pack_route(peak_loaded, inst)
+        if pen > 0 && length(peak_loaded) > 1
+            pen = _repair_pack(peak_loaded, inst)
+        end
+        unplaced += pen
+    end
+
+    return travel_cost + GAP_PENALTY[] * gap_sum + PENALTY_WEIGHT * unplaced
+end
+
+# ── ALNS warm-start conversion ────────────────────────────────────────────────
+"""
+    alns_to_chromosome(sol, pdp) -> Vector{Float64}
+
+Convert an ALNS PDPSolution into a BRKGA chromosome.  Rank genes are derived
+from each request's position in its vehicle route; vehicle-assignment genes
+map vehicle index k to the centre of the k-th interval in [0,1).
+Requires alns.jl to be loaded (PDPSolution must be defined).
+"""
+function alns_to_chromosome(sol, pdp::PDPInstance)::Vector{Float64}
+    n    = pdp.n
+    K    = pdp.K
+    inst = pdp.inst
+    chr  = rand(3 * n)   # random fallback for any unassigned request
+
+    req_vols = [sum(b.l * b.w * b.h for b in inst.requests[r].boxes)
+                for r in 1:length(inst.requests)]
+
+    for (k, route) in enumerate(sol.routes)
+        isempty(route) && continue
+        m    = length(route)   # 2 × requests in this vehicle
+        reqs = Int[]
+
+        for (pos, v) in enumerate(route)
+            r    = abs(v)
+            rank = (pos - 0.5) / m
+            if v > 0
+                chr[r] = rank
+                push!(reqs, r)
+            else
+                chr[n + r] = rank
+            end
+            chr[2n + r] = (k - 0.5) / K
+        end
+
+        # Verify BRKGA's peak-by-volume packing check on this route.
+        # If it fails even after repair, reset these genes to random so we
+        # don't inject an infeasible chromosome into the elite population.
         delivery_pos = Dict{Int,Int}()
         for (pos, v) in enumerate(route)
             v < 0 && (delivery_pos[-v] = pos)
@@ -151,22 +300,35 @@ function decode!(chromosome::Array{Float64,1},
 
         loaded      = Int[]
         peak_loaded = Int[]
+        peak_vol    = 0
+        loaded_vol  = 0
         for v in route
             if v > 0
                 push!(loaded, v)
-                if length(loaded) > length(peak_loaded)
+                loaded_vol += req_vols[v]
+                if loaded_vol > peak_vol
+                    peak_vol    = loaded_vol
                     peak_loaded = copy(loaded)
                 end
             else
+                loaded_vol -= req_vols[-v]
                 filter!(x -> x != -v, loaded)
             end
         end
 
         sort!(peak_loaded; by = r -> delivery_pos[r])
-        unplaced += pack_route(peak_loaded, inst)
-    end
+        pen = pack_route(peak_loaded, inst)
+        pen > 0 && length(peak_loaded) > 1 && (pen = _repair_pack(peak_loaded, inst))
 
-    return travel_cost + PENALTY_WEIGHT * unplaced
+        if pen > 0
+            for r in reqs
+                chr[r]      = rand()
+                chr[n + r]  = rand()
+                chr[2n + r] = rand()
+            end
+        end
+    end
+    return chr
 end
 
 # ── main solver ───────────────────────────────────────────────────────────────
@@ -182,7 +344,7 @@ function solve_brkga(inst::Instance;
 
     pdp_inst = PDPInstance(inst)
     n        = pdp_inst.n
-    chromosome_size = n   # one gene per request: vehicle assignment
+    chromosome_size = 3 * n   # pickup ranks + delivery ranks + vehicle assignment
 
     params = BrkgaParams()
     params.population_size           = POP_SIZE
@@ -191,7 +353,7 @@ function solve_brkga(inst::Instance;
     params.num_elite_parents         = NUM_ELITE_PAR
     params.total_parents             = TOTAL_PARENTS
     params.bias_type                 = BIAS
-    params.num_independent_populations = N_POPULATIONS
+    params.num_independent_populations = N_POPULATIONS[]
     params.pr_number_pairs           = 0
     params.pr_minimum_distance       = 0.15
     params.pr_type                   = BrkgaMpIpr.DIRECT
@@ -300,13 +462,23 @@ function _chromosome_to_pdp_routes(chr::Vector{Float64},
     n = pdp.n; K = pdp.K
     veh_reqs = [Int[] for _ in 1:K]
     for r in 1:n
-        k = min(K, floor(Int, chr[r] * K) + 1)
+        k = min(K, floor(Int, chr[2n + r] * K) + 1)
         push!(veh_reqs[k], r)
     end
     result = [Int[] for _ in 1:K]
     for k in 1:K
         isempty(veh_reqs[k]) && continue
-        result[k] = _nn_tour(veh_reqs[k], n, pdp.dist)
+        reqs = veh_reqs[k]
+        events = Tuple{Float64,Bool,Int}[]
+        for r in reqs
+            p_rank = chr[r]
+            d_rank = chr[n + r]
+            d_rank = d_rank > p_rank ? d_rank : p_rank + 1e-9
+            push!(events, (p_rank, false, r))
+            push!(events, (d_rank, true,  r))
+        end
+        sort!(events; by = x -> x[1])
+        result[k] = [is_del ? -r : r for (_, is_del, r) in events]
     end
     return result
 end

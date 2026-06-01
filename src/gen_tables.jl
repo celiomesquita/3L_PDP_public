@@ -1,8 +1,9 @@
 # Generate LaTeX tables from benchmark results CSV.
 #
-# Reads results/results.csv (produced by run_benchmark.jl) and writes:
-#   latex/tables/results_summary.tex   — Table 3: per-class averages
-#   latex/tables/results_detailed.tex  — Table 4: per-instance results
+# Reads memetic benchmark CSVs and writes reproducibility summaries to:
+#   results/tables/results_summary.txt
+#   results/tables/results_detailed.txt
+#   results/tables/results_hetero.txt
 #
 # Usage (from project root):
 #   julia --project=. src/gen_tables.jl
@@ -13,6 +14,25 @@
 
 using Printf
 using Statistics
+
+# Two-sided 95% t critical value (0.975 quantile); no extra package needed.
+function t975(df::Int)
+    df < 1  && return Inf
+    df >= 120 && return 1.980
+    df >= 100 && return 1.984
+    df >= 80  && return 1.990
+    df >= 60  && return 1.996
+    df >= 50  && return 2.009
+    df >= 40  && return 2.021
+    df >= 30  && return 2.042
+    df >= 20  && return 2.086
+    df >= 10  && return 2.228
+    df >= 5   && return 2.571
+    df == 4   && return 2.776
+    df == 3   && return 3.182
+    df == 2   && return 4.303
+    return 12.706  # df == 1
+end
 
 # ── M&B (2016) reference data ─────────────────────────────────────────────────
 # Format: class_key => (v5_avg, v5_gap_pct)
@@ -95,14 +115,18 @@ const MB_TIME_S = Dict(
 )
 
 # ── load CSV ──────────────────────────────────────────────────────────────────
+# Returns:
+#   results : Dict (inst_name, method) => Vector{Float64} of objectives
+#   times   : Dict (inst_name, method) => Vector{Float64} of wall-clock times
+#   vol_pct : Dict (inst_name, method) => Vector{Float64} of max_loaded_volume_pct
+#
+# Supports old schema (6 cols) and new schema (9 cols):
+#   instance,method,seed,obj,time_s,t_first_feasible_s,
+#   total_cargo_volume,max_loaded_volume,max_loaded_volume_pct
 function load_csv(path::String)
-    # Returns:
-    #   results  : Dict (inst_name, method) => Vector{Float64} of objectives
-    #   times    : Dict (inst_name, method) => Vector{Float64} of wall-clock times
-    #   pce_data : Dict (inst_name, method) => Vector{Float64} of per-run PCE values
-    results  = Dict{Tuple{String,String}, Vector{Float64}}()
-    times    = Dict{Tuple{String,String}, Vector{Float64}}()
-    pce_data = Dict{Tuple{String,String}, Vector{Float64}}()
+    results = Dict{Tuple{String,String}, Vector{Float64}}()
+    times   = Dict{Tuple{String,String}, Vector{Float64}}()
+    vol_pct = Dict{Tuple{String,String}, Vector{Float64}}()
     isfile(path) || error("CSV not found: $path")
     for line in eachline(path)
         (startswith(line, "instance") || contains(line, ",method,")) && continue
@@ -113,24 +137,145 @@ function load_csv(path::String)
         obj  = parse(Float64, strip(parts[4]))
         key  = (inst, meth)
         push!(get!(results, key, Float64[]), obj)
-        # wall-clock time (column 5, optional)
         if length(parts) >= 5
             t = tryparse(Float64, strip(parts[5]))
             isnothing(t) || push!(get!(times, key, Float64[]), t)
         end
-        # PCE columns (optional — old CSVs have only 5 columns)
-        if length(parts) >= 7
-            n_calls    = parse(Int, strip(parts[6]))
-            n_feasible = parse(Int, strip(parts[7]))
-            pce = n_calls > 0 ? n_feasible / n_calls : NaN
-            push!(get!(pce_data, key, Float64[]), pce)
+        # max_loaded_volume_pct is column 9 in the new schema; skip zeros (infeasible)
+        if length(parts) >= 9
+            v = tryparse(Float64, strip(parts[9]))
+            (isnothing(v) || v <= 0.0) || push!(get!(vol_pct, key, Float64[]), v)
         end
     end
-    return results, times, pce_data
+    return results, times, vol_pct
+end
+
+# Memetic benchmark schema:
+#   instance,variant,seed,time_limit_s,threads_default,threads_interactive,
+#   ttd,fitness,time_s,feasible,max_loaded_volume_pct,delta_v4_pct,...
+# The table writer expects method key "brkga" for the 3L-PDP family, so these
+# rows are normalized into the same Dict shape used by the older benchmark CSVs.
+function load_memetic_csv(path::String, expected_variant::String)
+    results = Dict{Tuple{String,String}, Vector{Float64}}()
+    times   = Dict{Tuple{String,String}, Vector{Float64}}()
+    vol_pct = Dict{Tuple{String,String}, Vector{Float64}}()
+    isfile(path) || return results, times, vol_pct
+
+    for line in eachline(path)
+        startswith(line, "instance,") && continue
+        parts = split(line, ",")
+        length(parts) >= 11 || continue
+        inst     = strip(parts[1])
+        variant  = strip(parts[2])
+        feasible = lowercase(strip(parts[10])) == "true"
+        variant == expected_variant || continue
+        feasible || continue
+
+        ttd = tryparse(Float64, strip(parts[7]))
+        isnothing(ttd) && continue
+        key = (inst, "brkga")
+        push!(get!(results, key, Float64[]), ttd)
+
+        elapsed = tryparse(Float64, strip(parts[9]))
+        isnothing(elapsed) || push!(get!(times, key, Float64[]), elapsed)
+
+        vol = tryparse(Float64, strip(parts[11]))
+        (isnothing(vol) || vol <= 0.0) || push!(get!(vol_pct, key, Float64[]), vol)
+    end
+    return results, times, vol_pct
+end
+
+# ── load M&B Table 19 volume data ─────────────────────────────────────────────
+# Reads extracted_tables/table_19_*.csv and returns instance => Variant 4* percent.
+# Normalises names: "50_RAND_2_1" -> "050_RAND_2_1".
+function load_mb_vol_pct(csv_path::String)::Dict{String, Float64}
+    vol = Dict{String, Float64}()
+    isfile(csv_path) || return vol
+    first = true
+    for line in eachline(csv_path)
+        if first; first = false; continue; end
+        parts = split(line, ",")
+        length(parts) >= 3 || continue
+        sp  = split(strip(parts[1]), "_")
+        n   = tryparse(Int, sp[1]); isnothing(n) && continue
+        name = @sprintf("%03d_%s", n, join(sp[2:end], "_"))
+        pct  = tryparse(Float64, strip(parts[3])); isnothing(pct) && continue
+        vol[name] = pct
+    end
+    return vol
 end
 
 # ── gap helper ────────────────────────────────────────────────────────────────
 gap_pct(val, baseline) = (val - baseline) / baseline * 100.0
+
+# 95% CI half-width (t on n-1 df) for a sample mean.
+function ci95_halfwidth(v::Vector{Float64})
+    n = length(v)
+    n < 2 && return NaN
+    t = t975(n - 1)
+    return t * std(v) / sqrt(n)
+end
+
+# Per-instance mean ΔV4 (avg over seeds) and aggregate stats from memetic CSV.
+function delta_v4_stats(results::Dict, mb_v4::Dict=MB2018_V4)
+    inst_deltas = Float64[]
+    seed_deltas = Float64[]
+    for ((inst, meth), vals) in results
+        meth != "brkga" && continue
+        ref = get(mb_v4, inst, NaN)
+        isnan(ref) && continue
+        for v in vals
+            push!(seed_deltas, gap_pct(v, ref))
+        end
+        push!(inst_deltas, mean(gap_pct(v, ref) for v in vals))
+    end
+    μ  = isempty(inst_deltas) ? NaN : mean(inst_deltas)
+    hw = ci95_halfwidth(inst_deltas)
+    seed_hw = ci95_halfwidth(seed_deltas)
+    return (inst_mean=μ, inst_ci_hw=hw, seed_mean=isempty(seed_deltas) ? NaN : mean(seed_deltas),
+            seed_ci_hw=seed_hw, n_inst=length(inst_deltas), n_runs=length(seed_deltas))
+end
+
+# ── density CV across all requests in instance files ──────────────────────────
+function request_densities_from_file(path::String)
+    densities = Float64[]
+    lines = readlines(path)
+    length(lines) < 3 && return densities
+    for line in lines[3:end]
+        tok = split(strip(line))
+        length(tok) < 9 && continue
+        weight = tryparse(Float64, tok[8])
+        nbox   = tryparse(Int, tok[9])
+        (isnothing(weight) || isnothing(nbox) || nbox <= 0) && continue
+        vol = 0.0
+        idx = 10
+        for _ in 1:nbox
+            idx + 2 > length(tok) && break
+            l = tryparse(Float64, tok[idx])
+            w = tryparse(Float64, tok[idx + 1])
+            h = tryparse(Float64, tok[idx + 2])
+            if !isnothing(l) && !isnothing(w) && !isnothing(h)
+                vol += l * w * h
+            end
+            idx += 4
+        end
+        vol > 0 && push!(densities, weight / vol)
+    end
+    return densities
+end
+
+function density_cv_from_dir(dir::String)
+    isdir(dir) || return NaN
+    densities = Float64[]
+    for fname in readdir(dir)
+        endswith(fname, ".txt") || continue
+        append!(densities, request_densities_from_file(joinpath(dir, fname)))
+    end
+    isempty(densities) && return NaN
+    μ = mean(densities)
+    abs(μ) < 1e-12 && return NaN
+    std(densities) / μ
+end
 
 # ── format helpers ────────────────────────────────────────────────────────────
 fmt2(x) = isnan(x) ? "--" : @sprintf("%.2f", x)
@@ -257,36 +402,37 @@ function write_summary(results, density, ss, times, out_path)
 end
 
 # ── write results_detailed.tex ────────────────────────────────────────────────
-# Column order: Instance | M&B V4 | 3L-PDP (Avg, ΔV4) | 3L-PDP-D (Avg, ΔV4) | 3L-PDP-S (Avg, ΔV4)
-function write_detailed(results, density, ss, out_path)
+# Columns: Instance | M&B V4 (ttd, vol%) | 3L-PDP (Avg, ΔV4, vol%) |
+#          3L-PDP-D (Avg, ΔV4, vol%) | 3L-PDP-S (Avg, ΔV4, vol%)
+function write_detailed(results, density, ss,
+                        res_vol, dens_vol, ss_vol, mb_vol_pct,
+                        out_path; mb_density_cv::Float64=NaN,
+                        dv4_stats=nothing)
     sizes   = [50, 75, 100]
     layouts = ["RAND", "CLUS", "CPCD"]
     boxes   = [2, 3]
 
-    all_v4_avg  = Float64[]
-    all_pdp_avg = Float64[]
-    all_pdp_dv4 = Float64[]
-    all_dpd_avg = Float64[]
-    all_dpd_dv4 = Float64[]
-    all_ss_avg  = Float64[]
-    all_ss_dv4  = Float64[]
+    all_v4_avg  = Float64[];  all_v4_vol  = Float64[]
+    all_pdp_avg = Float64[];  all_pdp_dv4 = Float64[];  all_pdp_vol = Float64[]
+    all_dpd_avg = Float64[];  all_dpd_dv4 = Float64[];  all_dpd_vol = Float64[]
+    all_ss_avg  = Float64[];  all_ss_dv4  = Float64[];  all_ss_vol  = Float64[]
 
-    hdr1 = " & & \\multicolumn{2}{c}{3L-PDP} & \\multicolumn{2}{c}{3L-PDP-D} & \\multicolumn{2}{c}{3L-PDP-S} \\\\"
-    hdr2 = raw"\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}"
-    hdr3 = " Instance & M\\&B~V4 & Avg & \$\\Delta\$V4 & Avg & \$\\Delta\$V4 & Avg & \$\\Delta\$V4 \\\\"
+    hdr1 = " Instance & \\multicolumn{2}{c}{M\\&B~V4} & \\multicolumn{3}{c}{3L-PDP} & \\multicolumn{3}{c}{3L-PDP-D} & \\multicolumn{3}{c}{3L-PDP-S} \\\\"
+    hdr2 = raw"\cmidrule(lr){2-3}\cmidrule(lr){4-6}\cmidrule(lr){7-9}\cmidrule(lr){10-12}"
+    hdr3 = " Instance & ttd & vol\\% & Avg & \$\\Delta\$V4 & vol\\% & Avg & \$\\Delta\$V4 & vol\\% & Avg & \$\\Delta\$V4 & vol\\% \\\\"
 
     open(out_path, "w") do io
         println(io, raw"% Auto-generated by gen_tables.jl — do not edit manually.")
-        println(io, raw"{\footnotesize\setlength{\tabcolsep}{3pt}%")
-        println(io, raw"\begin{longtable}{@{}l r rr rr rr@{}}")
-        println(io, raw"\caption{Per-instance results (avg over 5 seeds). $\Delta$V4 = gap vs.\ M\&B (2018) V4 (\%; negative means better than V4). 3L-PDP-D adds density stacking constraint (PC5); 3L-PDP-S adds structural stacking constraint (PC6) via BCT.}")
+        println(io, raw"{\footnotesize\setlength{\tabcolsep}{2.4pt}%")
+        println(io, raw"\begin{longtable}{@{}l rr rrr rrr rrr@{}}")
+        println(io, raw"\caption{Per-instance results (avg over 5 seeds).}")
         println(io, "\\label{tab:results_detailed}\\\\")
         println(io, raw"\toprule")
         println(io, hdr1); println(io, hdr2); println(io, hdr3)
         println(io, raw"\midrule\endfirsthead")
         println(io, "\\toprule"); println(io, hdr1); println(io, hdr2)
         println(io, hdr3 * raw"\midrule\endhead")
-        println(io, raw"\midrule\multicolumn{8}{r}{\footnotesize(continued)}\endfoot")
+        println(io, raw"\midrule\multicolumn{12}{r}{\footnotesize(continued)}\endfoot")
         println(io, raw"\bottomrule\endlastfoot")
 
         for size in sizes
@@ -295,27 +441,38 @@ function write_detailed(results, density, ss, out_path)
                 for box in boxes
                     for idx in 1:n_inst_size
                         inst_name = @sprintf("%03d_%s_%d_%d", size, layout, box, idx)
-                        v4_v      = get(MB2018_V4, inst_name, NaN)
+                        v4_v      = get(MB2018_V4,  inst_name, NaN)
+                        v4_vol_v  = get(mb_vol_pct, inst_name, NaN)
                         pdp_vals  = get(results, (inst_name, "brkga"), Float64[])
                         dpd_vals  = get(density, (inst_name, "brkga"), Float64[])
                         ss_vals   = get(ss,      (inst_name, "brkga"), Float64[])
+                        pdp_vols  = get(res_vol,  (inst_name, "brkga"), Float64[])
+                        dpd_vols  = get(dens_vol, (inst_name, "brkga"), Float64[])
+                        ss_vols   = get(ss_vol,   (inst_name, "brkga"), Float64[])
 
-                        pdp_avg = isempty(pdp_vals) ? NaN : mean(pdp_vals)
-                        dpd_avg = isempty(dpd_vals) ? NaN : mean(dpd_vals)
-                        ss_avg  = isempty(ss_vals)  ? NaN : mean(ss_vals)
-                        pdp_dv4 = (isnan(pdp_avg) || isnan(v4_v)) ? NaN : gap_pct(pdp_avg, v4_v)
-                        dpd_dv4 = (isnan(dpd_avg) || isnan(v4_v)) ? NaN : gap_pct(dpd_avg, v4_v)
-                        ss_dv4  = (isnan(ss_avg)  || isnan(v4_v)) ? NaN : gap_pct(ss_avg,  v4_v)
+                        pdp_avg  = isempty(pdp_vals) ? NaN : mean(pdp_vals)
+                        dpd_avg  = isempty(dpd_vals) ? NaN : mean(dpd_vals)
+                        ss_avg   = isempty(ss_vals)  ? NaN : mean(ss_vals)
+                        pdp_volm = isempty(pdp_vols) ? NaN : mean(pdp_vols)
+                        dpd_volm = isempty(dpd_vols) ? NaN : mean(dpd_vols)
+                        ss_volm  = isempty(ss_vols)  ? NaN : mean(ss_vols)
+                        pdp_dv4  = (isnan(pdp_avg) || isnan(v4_v)) ? NaN : gap_pct(pdp_avg, v4_v)
+                        dpd_dv4  = (isnan(dpd_avg) || isnan(v4_v)) ? NaN : gap_pct(dpd_avg, v4_v)
+                        ss_dv4   = (isnan(ss_avg)  || isnan(v4_v)) ? NaN : gap_pct(ss_avg,  v4_v)
 
                         isnan(v4_v)    || push!(all_v4_avg,  v4_v)
+                        isnan(v4_vol_v) || push!(all_v4_vol, v4_vol_v)
                         isnan(pdp_avg) || push!(all_pdp_avg, pdp_avg)
                         isnan(pdp_dv4) || push!(all_pdp_dv4, pdp_dv4)
+                        isnan(pdp_volm) || push!(all_pdp_vol, pdp_volm)
                         isnan(dpd_avg) || push!(all_dpd_avg, dpd_avg)
                         isnan(dpd_dv4) || push!(all_dpd_dv4, dpd_dv4)
+                        isnan(dpd_volm) || push!(all_dpd_vol, dpd_volm)
                         isnan(ss_avg)  || push!(all_ss_avg,  ss_avg)
                         isnan(ss_dv4)  || push!(all_ss_dv4,  ss_dv4)
+                        isnan(ss_volm) || push!(all_ss_vol,  ss_volm)
 
-                        # Bold the overall minimum of {V4, 3L-PDP, 3L-PDP-D, 3L-PDP-S}
+                        # Bold the minimum ttd among {V4, 3L-PDP, 3L-PDP-D, 3L-PDP-S}
                         candidates = filter(!isnan, [v4_v, pdp_avg, dpd_avg, ss_avg])
                         min_avg = isempty(candidates) ? NaN : minimum(candidates)
                         near_min(x) = !isnan(min_avg) && abs(x - min_avg) < 1e-9
@@ -323,18 +480,26 @@ function write_detailed(results, density, ss, out_path)
                         f(x)  = @sprintf("%.2f", x)
                         fb(x) = "\$\\mathbf{$(@sprintf("%.2f", x))}\$"
                         fg(x) = @sprintf("%+.2f", x)
+                        fv(x) = @sprintf("%.1f", x)
 
-                        v4_s   = isnan(v4_v)    ? "--" : (near_min(v4_v)    ? fb(v4_v)    : f(v4_v))
-                        pdp_s  = isnan(pdp_avg) ? "--" : (near_min(pdp_avg) ? fb(pdp_avg) : f(pdp_avg))
-                        dpd_s  = isnan(dpd_avg) ? "--" : (near_min(dpd_avg) ? fb(dpd_avg) : f(dpd_avg))
-                        ss_s   = isnan(ss_avg)  ? "--" : (near_min(ss_avg)  ? fb(ss_avg)  : f(ss_avg))
-                        pdv4_s = isnan(pdp_dv4) ? "--" : fg(pdp_dv4)
-                        ddv4_s = isnan(dpd_dv4) ? "--" : fg(dpd_dv4)
-                        sdv4_s = isnan(ss_dv4)  ? "--" : fg(ss_dv4)
+                        v4_s      = isnan(v4_v)    ? "--" : (near_min(v4_v)    ? fb(v4_v)    : f(v4_v))
+                        pdp_s     = isnan(pdp_avg) ? "--" : (near_min(pdp_avg) ? fb(pdp_avg) : f(pdp_avg))
+                        dpd_s     = isnan(dpd_avg) ? "--" : (near_min(dpd_avg) ? fb(dpd_avg) : f(dpd_avg))
+                        ss_s      = isnan(ss_avg)  ? "--" : (near_min(ss_avg)  ? fb(ss_avg)  : f(ss_avg))
+                        v4_vol_s  = isnan(v4_vol_v) ? "--" : fv(v4_vol_v)
+                        pdp_vol_s = isnan(pdp_volm) ? "--" : fv(pdp_volm)
+                        dpd_vol_s = isnan(dpd_volm) ? "--" : fv(dpd_volm)
+                        ss_vol_s  = isnan(ss_volm)  ? "--" : fv(ss_volm)
+                        pdv4_s    = isnan(pdp_dv4)  ? "--" : fg(pdp_dv4)
+                        ddv4_s    = isnan(dpd_dv4)  ? "--" : fg(dpd_dv4)
+                        sdv4_s    = isnan(ss_dv4)   ? "--" : fg(ss_dv4)
 
-                        @printf(io, "%s & %s & %s & %s & %s & %s & %s & %s \\\\\n",
+                        @printf(io, "%s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s \\\\\n",
                                 replace(inst_name, "_" => "\\_"),
-                                v4_s, pdp_s, pdv4_s, dpd_s, ddv4_s, ss_s, sdv4_s)
+                                v4_s,   v4_vol_s,
+                                pdp_s,  pdv4_s,  pdp_vol_s,
+                                dpd_s,  ddv4_s,  dpd_vol_s,
+                                ss_s,   sdv4_s,  ss_vol_s)
                     end
                     println(io, raw"\midrule")
                 end
@@ -343,58 +508,71 @@ function write_detailed(results, density, ss, out_path)
 
         fmtavg(v)  = isempty(v) ? "--" : @sprintf("%.2f", mean(v))
         fmtavgg(v) = isempty(v) ? "--" : @sprintf("%+.2f", mean(v))
+        fmtvol(v)  = isempty(v) ? "--" : @sprintf("%.1f", mean(v))
 
         avg_v4  = isempty(all_v4_avg)  ? NaN : mean(all_v4_avg)
         avg_pdp = isempty(all_pdp_avg) ? NaN : mean(all_pdp_avg)
         avg_dpd = isempty(all_dpd_avg) ? NaN : mean(all_dpd_avg)
         avg_ss  = isempty(all_ss_avg)  ? NaN : mean(all_ss_avg)
-        avg_min = minimum(filter(!isnan, [avg_v4, avg_pdp, avg_dpd, avg_ss]))
-        fbavg(x) = isnan(x) ? "--" : (abs(x - avg_min) < 1e-9 ? "\$\\mathbf{$(@sprintf("%.2f",x))}\$" : @sprintf("%.2f",x))
+        avg_cands = filter(!isnan, [avg_v4, avg_pdp, avg_dpd, avg_ss])
+        avg_min   = isempty(avg_cands) ? NaN : minimum(avg_cands)
+        fbavg(x)  = isnan(x) ? "--" : (isnan(avg_min) || abs(x - avg_min) >= 1e-9 ?
+                        @sprintf("%.2f", x) : "\$\\mathbf{$(@sprintf("%.2f",x))}\$")
 
-        @printf(io, "\\textbf{Average} & %s & %s & %s & %s & %s & %s & %s \\\\\n",
-                fbavg(avg_v4),
-                fbavg(avg_pdp), fmtavgg(all_pdp_dv4),
-                fbavg(avg_dpd), fmtavgg(all_dpd_dv4),
-                fbavg(avg_ss),  fmtavgg(all_ss_dv4))
+        @printf(io, "\\textbf{Average} & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s & %s \\\\\n",
+                fbavg(avg_v4),  fmtvol(all_v4_vol),
+                fbavg(avg_pdp), fmtavgg(all_pdp_dv4), fmtvol(all_pdp_vol),
+                fbavg(avg_dpd), fmtavgg(all_dpd_dv4), fmtvol(all_dpd_vol),
+                fbavg(avg_ss),  fmtavgg(all_ss_dv4),  fmtvol(all_ss_vol))
 
+        r_ds = (length(all_dpd_dv4) >= 2 && length(all_dpd_dv4) == length(all_ss_dv4)) ?
+               cor(all_dpd_dv4, all_ss_dv4) : NaN
+        cv_s = isnan(mb_density_cv) ? "--" : @sprintf("%.2f", mb_density_cv)
+        r_s  = isnan(r_ds) ? "--" : @sprintf("%.4f", r_ds)
+
+        println(io, "\\multicolumn{12}{l}{\\footnotesize Density CV\\,(\$\\sigma/\\mu\$) across requests: \$" * cv_s * "\$.}\\\\")
+        println(io, "\\multicolumn{12}{l}{\\footnotesize Pearson \$r{=}" * r_s * "\$ between \$\\Delta\$V4 of 3L-PDP-D and 3L-PDP-S (policy-alignment diagnostic on homogeneous cargo).}\\\\")
+        if !isnothing(dv4_stats) && !isnan(dv4_stats.inst_mean)
+            lo = dv4_stats.inst_mean - dv4_stats.inst_ci_hw
+            hi = dv4_stats.inst_mean + dv4_stats.inst_ci_hw
+            @printf(io, "\\multicolumn{12}{l}{\\footnotesize Mean \$\\Delta\$V4 (per-instance avg over 5 seeds): \$%+.2f\\%%\$; 95\\%% CI \$[%+.2f\\%%,\\,%+.2f\\%%]\$ (\$n{=} %d\$ instances).}\\\\\n",
+                    dv4_stats.inst_mean, lo, hi, dv4_stats.n_inst)
+        end
         println(io, raw"\end{longtable}}")
     end
     println("  Written: $out_path")
 end
 
 # ── write results_hetero.tex ──────────────────────────────────────────────────
-# Compares 3L-PDP-H, 3L-PDP-D, and 3L-PDP-C on the synthetic heterogeneous
-# instances (3L_PDP_instances_hetero/).  No M&B V4 reference exists for these
-# instances; the gap (ΔBase) is relative to the 3L-PDP-H baseline.
-# The Win D/C column counts how many instances within the class are won by
-# PC5 (D) vs PC7 (C), the key metric showing divergence from the near-tie
-# observed on the M&B benchmark.
-function write_hetero_summary(base, density, ss, out_path)
+# Columns: n | Class | |H| | 3L-PDP-H (Avg, vol%) |
+#          3L-PDP-D (Avg, ΔBase, vol%) | 3L-PDP-C (Avg, ΔBase, vol%)
+# ΔBase = gap relative to 3L-PDP-H baseline (%; positive = longer route).
+# vol%  = mean max-loaded-volume utilisation (max onboard cargo / vehicle capacity).
+function write_hetero_summary(base, density, ss, base_vol, dens_vol, ss_vol, out_path;
+                              hetero_density_cv::Float64=NaN)
     sizes   = [50, 75, 100]
     layouts = ["RAND", "CLUS", "CPCD"]
     boxes   = [2, 3]
-    n_h     = 5    # H-seed variants per base instance
+    n_h     = 5
 
-    all_base_avg = Float64[]
-    all_dpd_avg  = Float64[]
-    all_ss_avg   = Float64[]
-    all_dpd_db   = Float64[]
-    all_ss_db    = Float64[]
-    total_wins_d = 0
-    total_wins_s = 0
+    all_base_avg = Float64[];  all_base_vol = Float64[]
+    all_dpd_avg  = Float64[];  all_dpd_db   = Float64[];  all_dpd_vol = Float64[]
+    all_ss_avg   = Float64[];  all_ss_db    = Float64[];  all_ss_vol  = Float64[]
+
+    all_inst_base = Float64[];  all_inst_base_vol = Float64[]
+    all_inst_dpd  = Float64[];  all_inst_dpd_vol  = Float64[]
+    all_inst_ss   = Float64[];  all_inst_ss_vol   = Float64[]
+    all_inst_d_db = Float64[];  all_inst_c_db     = Float64[]
 
     open(out_path, "w") do io
         println(io, "% Auto-generated by gen_tables.jl — do not edit manually.")
-        println(io, raw"{\footnotesize\renewcommand{\arraystretch}{0.85}\setlength{\tabcolsep}{3pt}%")
-        println(io, raw"\begin{tabular}{@{}llc r rr rr c@{}}")
+        println(io, raw"{\footnotesize\renewcommand{\arraystretch}{0.85}\setlength{\tabcolsep}{2pt}%")
+        println(io, raw"\begin{tabular}{@{}llc rr rrr rrr@{}}")
         println(io, raw"\toprule")
-        println(io, raw"\multirow{2}{*}{$n$} & \multirow{2}{*}{Class}")
-        println(io, raw"  & \multirow{2}{*}{$|\mathcal{H}|$}")
-        println(io, raw"  & \multirow{2}{*}{3L-PDP-H}")
-        println(io, raw"  & \multicolumn{2}{c}{3L-PDP-D} & \multicolumn{2}{c}{3L-PDP-C}")
-        println(io, raw"  & Win \\\\")
-        println(io, raw"\cmidrule(lr){5-6}\cmidrule(lr){7-8}")
-        println(io, raw" & & & & Avg & $\Delta$Base & Avg & $\Delta$Base & D\,/\,C \\\\")
+        println(io, raw"\multirow{2}{*}{$n$} & \multirow{2}{*}{Class} & \multirow{2}{*}{$|\mathcal{H}|$}")
+        println(io, raw"  & \multicolumn{2}{c}{3L-PDP-H} & \multicolumn{3}{c}{3L-PDP-D} & \multicolumn{3}{c}{3L-PDP-C} \\\\")
+        println(io, raw"\cmidrule(lr){4-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}")
+        println(io, raw" & & & Avg & vol\% & Avg & $\Delta$Base & vol\% & Avg & $\Delta$Base & vol\% \\\\")
         println(io, raw"\midrule")
 
         for size in sizes
@@ -405,10 +583,9 @@ function write_hetero_summary(base, density, ss, out_path)
                 for box in boxes
                     n_total_h = n_inst_size * n_h
 
-                    base_avgs = Float64[]
-                    dpd_avgs  = Float64[]
-                    ss_avgs   = Float64[]
-                    d_wins = 0; s_wins = 0
+                    base_avgs = Float64[];  base_vols = Float64[]
+                    dpd_avgs  = Float64[];  dpd_vols  = Float64[]
+                    ss_avgs   = Float64[];  ss_vols   = Float64[]
 
                     for idx in 1:n_inst_size
                         for h in 1:n_h
@@ -416,43 +593,57 @@ function write_hetero_summary(base, density, ss, out_path)
                             b_v = haskey(base,    (k, "brkga")) ? mean(base[(k,    "brkga")]) : NaN
                             d_v = haskey(density, (k, "brkga")) ? mean(density[(k, "brkga")]) : NaN
                             s_v = haskey(ss,      (k, "brkga")) ? mean(ss[(k,     "brkga")]) : NaN
+                            bvl = haskey(base_vol, (k, "brkga")) ? mean(base_vol[(k, "brkga")]) : NaN
+                            dvl = haskey(dens_vol, (k, "brkga")) ? mean(dens_vol[(k, "brkga")]) : NaN
+                            svl = haskey(ss_vol,   (k, "brkga")) ? mean(ss_vol[(k,   "brkga")]) : NaN
                             isnan(b_v) || push!(base_avgs, b_v)
                             isnan(d_v) || push!(dpd_avgs,  d_v)
                             isnan(s_v) || push!(ss_avgs,   s_v)
-                            if !isnan(d_v) && !isnan(s_v)
-                                d_v < s_v && (d_wins += 1)
-                                d_v > s_v && (s_wins += 1)
+                            isnan(bvl) || push!(base_vols, bvl)
+                            isnan(dvl) || push!(dpd_vols,  dvl)
+                            isnan(svl) || push!(ss_vols,   svl)
+                            if !isnan(b_v)
+                                push!(all_inst_base, b_v)
+                                isnan(bvl) || push!(all_inst_base_vol, bvl)
+                                !isnan(d_v) && push!(all_inst_d_db, gap_pct(d_v, b_v))
+                                !isnan(s_v) && push!(all_inst_c_db, gap_pct(s_v, b_v))
                             end
+                            !isnan(d_v) && push!(all_inst_dpd, d_v)
+                            !isnan(s_v) && push!(all_inst_ss, s_v)
+                            !isnan(dvl) && push!(all_inst_dpd_vol, dvl)
+                            !isnan(svl) && push!(all_inst_ss_vol, svl)
                         end
                     end
 
                     base_avg = isempty(base_avgs) ? NaN : mean(base_avgs)
                     dpd_avg  = isempty(dpd_avgs)  ? NaN : mean(dpd_avgs)
                     ss_avg   = isempty(ss_avgs)   ? NaN : mean(ss_avgs)
+                    base_volm = isempty(base_vols) ? NaN : mean(base_vols)
+                    dpd_volm  = isempty(dpd_vols)  ? NaN : mean(dpd_vols)
+                    ss_volm   = isempty(ss_vols)   ? NaN : mean(ss_vols)
                     dpd_db   = (isnan(dpd_avg) || isnan(base_avg)) ? NaN : gap_pct(dpd_avg, base_avg)
                     ss_db    = (isnan(ss_avg)  || isnan(base_avg)) ? NaN : gap_pct(ss_avg,  base_avg)
 
-                    isnan(base_avg) || push!(all_base_avg, base_avg)
-                    isnan(dpd_avg)  || push!(all_dpd_avg,  dpd_avg)
-                    isnan(ss_avg)   || push!(all_ss_avg,   ss_avg)
-                    isnan(dpd_db)   || push!(all_dpd_db,   dpd_db)
-                    isnan(ss_db)    || push!(all_ss_db,    ss_db)
-                    total_wins_d += d_wins
-                    total_wins_s += s_wins
+                    isnan(base_avg)  || push!(all_base_avg, base_avg)
+                    isnan(base_volm) || push!(all_base_vol, base_volm)
+                    isnan(dpd_avg)   || push!(all_dpd_avg,  dpd_avg)
+                    isnan(dpd_db)    || push!(all_dpd_db,   dpd_db)
+                    isnan(dpd_volm)  || push!(all_dpd_vol,  dpd_volm)
+                    isnan(ss_avg)    || push!(all_ss_avg,   ss_avg)
+                    isnan(ss_db)     || push!(all_ss_db,    ss_db)
+                    isnan(ss_volm)   || push!(all_ss_vol,   ss_volm)
 
                     size_str   = first_size ? "\\multirow{6}{*}{$size}" : ""
                     first_size = false
-
-                    win_str = (d_wins == 0 && s_wins == 0) ? "--" :
-                               "$d_wins\\,/\\,$s_wins"
+                    fv(x) = isnan(x) ? "--" : @sprintf("%.1f", x)
+                    fd(x) = isnan(x) ? "--" : @sprintf("%+.2f", x)
 
                     @printf(io,
-                        "  %s & %s, %d box & %d & %s & %s & %s & %s & %s & %s \\\\\n",
+                        "  %s & %s, %d box & %d & %s & %s & %s & %s & %s & %s & %s & %s \\\\\n",
                         size_str, layout, box, n_total_h,
-                        fmt2(base_avg),
-                        fmt2(dpd_avg), isnan(dpd_db) ? "--" : @sprintf("%+.2f", dpd_db),
-                        fmt2(ss_avg),  isnan(ss_db)  ? "--" : @sprintf("%+.2f", ss_db),
-                        win_str)
+                        fmt2(base_avg), fv(base_volm),
+                        fmt2(dpd_avg),  fd(dpd_db),  fv(dpd_volm),
+                        fmt2(ss_avg),   fd(ss_db),   fv(ss_volm))
                 end
             end
             println(io, raw"\midrule")
@@ -460,15 +651,28 @@ function write_hetero_summary(base, density, ss, out_path)
 
         fmtavg(v)   = isempty(v) ? "--" : @sprintf("%.2f", mean(v))
         fmtdelta(v) = isempty(v) ? "--" : @sprintf("%+.2f", mean(v))
-        n_tot = sum(size == 50 ? 5 : (size == 75 ? 3 : 1) for size in sizes) * 3 * 2 * n_h
+        fmtvol(v)   = isempty(v) ? "--" : @sprintf("%.1f",  mean(v))
+        n_tot = length(all_inst_base)
+
+        g_base = isempty(all_inst_base) ? NaN : mean(all_inst_base)
+        g_dpd  = isempty(all_inst_dpd)  ? NaN : mean(all_inst_dpd)
+        g_ss   = isempty(all_inst_ss)   ? NaN : mean(all_inst_ss)
+        g_d_db = isempty(all_inst_d_db) ? NaN : mean(all_inst_d_db)
+        g_c_db = isempty(all_inst_c_db) ? NaN : mean(all_inst_c_db)
+        r_db   = (length(all_inst_d_db) >= 2 &&
+                  length(all_inst_d_db) == length(all_inst_c_db)) ?
+                 cor(all_inst_d_db, all_inst_c_db) : NaN
+        cv_s   = isnan(hetero_density_cv) ? "--" : @sprintf("%.2f", hetero_density_cv)
+        r_s    = isnan(r_db) ? "--" : @sprintf("%.4f", r_db)
 
         @printf(io,
-            "\\textbf{Avg} & & \\textbf{%d} & %s & %s & %s & %s & %s & %s\\,/\\,%s \\\\\n",
+            "\\textbf{Avg} & & \\textbf{%d} & %s & %s & %s & %s & %s & %s & %s & %s \\\\\n",
             n_tot,
-            fmtavg(all_base_avg),
-            fmtavg(all_dpd_avg),  fmtdelta(all_dpd_db),
-            fmtavg(all_ss_avg),   fmtdelta(all_ss_db),
-            total_wins_d, total_wins_s)
+            fmtavg(all_inst_base), fmtvol(all_inst_base_vol),
+            fmtavg(all_inst_dpd),  fmtdelta(g_d_db), fmtvol(all_inst_dpd_vol),
+            fmtavg(all_inst_ss),   fmtdelta(g_c_db), fmtvol(all_inst_ss_vol))
+        println(io, "\\multicolumn{11}{l}{\\footnotesize Density CV\\,(\$\\sigma/\\mu\$) across requests: \$" * cv_s * "\$.}\\\\")
+        println(io, "\\multicolumn{11}{l}{\\footnotesize Pearson \$r{=}" * r_s * "\$ between \$\\Delta\$Base of 3L-PDP-D and 3L-PDP-C.}\\\\")
         println(io, raw"\bottomrule")
         println(io, raw"\end{tabular}}")
     end
@@ -553,90 +757,151 @@ end
 # ── entry point ────────────────────────────────────────────────────────────────
 function main()
     results_dir  = joinpath(@__DIR__, "..", "results")
-    summary_out  = joinpath(@__DIR__, "..", "latex", "tables", "results_summary.tex")
-    detailed_out = joinpath(@__DIR__, "..", "latex", "tables", "results_detailed.tex")
-    density_out  = joinpath(@__DIR__, "..", "latex", "tables", "density_comparison.tex")
-    hetero_out   = joinpath(@__DIR__, "..", "latex", "tables", "results_hetero.tex")
+    tables_dir   = joinpath(@__DIR__, "..", "results", "tables")
+    mkpath(tables_dir)
+    summary_out  = joinpath(tables_dir, "results_summary.txt")
+    detailed_out = joinpath(tables_dir, "results_detailed.txt")
+    hetero_out   = joinpath(tables_dir, "results_hetero.txt")
 
+    # M&B Table 19 volume data (Variant 4* percent per instance)
+    mb_vol_csv = joinpath(results_dir, "extracted_tables",
+                          "table_19_maximal_loaded_volumes_complete_results.csv")
+    mb_vol_pct = load_mb_vol_pct(mb_vol_csv)
+    println("Loaded $(length(mb_vol_pct)) M&B vol% entries from Table 19")
+    println()
+
+    # BRKGA baseline results
     csv_files = [
-        joinpath(results_dir, "results.csv"),            # BRKGA benchmark (54 instances × 5 seeds)
-        joinpath(results_dir, "results_alns_greedy.csv"), # ALNS benchmark (54 instances × 5 seeds)
+        joinpath(results_dir, "results.csv"),
+        joinpath(results_dir, "results_alns_greedy.csv"),
     ]
-    results  = Dict{Tuple{String,String}, Vector{Float64}}()
-    times    = Dict{Tuple{String,String}, Vector{Float64}}()
-    pce_data = Dict{Tuple{String,String}, Vector{Float64}}()
+    results = Dict{Tuple{String,String}, Vector{Float64}}()
+    times   = Dict{Tuple{String,String}, Vector{Float64}}()
+    res_vol = Dict{Tuple{String,String}, Vector{Float64}}()
     for csv_path in csv_files
         isfile(csv_path) || continue
         println("Loading results from $csv_path ...")
-        partial_res, partial_times, partial_pce = load_csv(csv_path)
-        for (k, v) in partial_res;   append!(get!(results,  k, Float64[]), v); end
-        for (k, v) in partial_times; append!(get!(times,    k, Float64[]), v); end
-        for (k, v) in partial_pce;   append!(get!(pce_data, k, Float64[]), v); end
+        partial_res, partial_times, partial_vol = load_csv(csv_path)
+        for (k, v) in partial_res;   append!(get!(results, k, Float64[]), v); end
+        for (k, v) in partial_times; append!(get!(times,   k, Float64[]), v); end
+        for (k, v) in partial_vol;   append!(get!(res_vol, k, Float64[]), v); end
     end
-    n_runs  = sum(length(v) for v in values(results))
-    n_pce   = isempty(pce_data) ? 0 : sum(length(v) for v in values(pce_data))
-    println("  $n_runs run records loaded ($(length(results)) unique (instance,method) pairs)")
-    println("  $n_pce runs with PCE data")
+    memetic_csv = joinpath(results_dir, "memetic_benchmark_3lpdp.csv")
+    if isfile(memetic_csv)
+        println("Loading memetic baseline from $memetic_csv ...")
+        results, times, res_vol = load_memetic_csv(memetic_csv, "3lpdp")
+        println("  $(sum(length(v) for v in values(results))) memetic baseline run records")
+    end
+    println("  $(sum(length(v) for v in values(results))) run records loaded")
     println()
 
-    # Load density results (optional)
+    # Density (PC5) results
     density_csv = joinpath(results_dir, "results_density.csv")
+    memetic_density_csv = joinpath(results_dir, "memetic_benchmark_3lpdp_d.csv")
     dens_res = Dict{Tuple{String,String}, Vector{Float64}}()
-    if isfile(density_csv)
+    dens_vol = Dict{Tuple{String,String}, Vector{Float64}}()
+    if isfile(memetic_density_csv)
+        println("Loading memetic density results from $memetic_density_csv ...")
+        dens_res, _, dens_vol = load_memetic_csv(memetic_density_csv, "3lpdp_d")
+        println("  $(sum(length(v) for v in values(dens_res))) memetic density run records")
+    elseif isfile(density_csv)
         println("Loading density results from $density_csv ...")
-        dens_res, _, _ = load_csv(density_csv)
+        dens_res, _, dens_vol = load_csv(density_csv)
         println("  $(sum(length(v) for v in values(dens_res))) density run records")
     else
         println("  Note: results_density.csv not found — 3L-PDP-D columns will be empty")
     end
     println()
 
-    # Load structural stacking (SS) results (optional)
+    # Structural stacking (PC6) results
     ss_csv = joinpath(results_dir, "results_ss.csv")
+    memetic_ss_csv = joinpath(results_dir, "memetic_benchmark_3lpdp_s.csv")
     ss_res = Dict{Tuple{String,String}, Vector{Float64}}()
-    if isfile(ss_csv)
+    ss_vol = Dict{Tuple{String,String}, Vector{Float64}}()
+    if isfile(memetic_ss_csv)
+        println("Loading memetic SS results from $memetic_ss_csv ...")
+        ss_res, _, ss_vol = load_memetic_csv(memetic_ss_csv, "3lpdp_s")
+        println("  $(sum(length(v) for v in values(ss_res))) memetic SS run records")
+    elseif isfile(ss_csv)
         println("Loading SS results from $ss_csv ...")
-        ss_res, _, _ = load_csv(ss_csv)
+        ss_res, _, ss_vol = load_csv(ss_csv)
         println("  $(sum(length(v) for v in values(ss_res))) SS run records")
     else
         println("  Note: results_ss.csv not found — 3L-PDP-S columns will be empty")
     end
     println()
 
-    # Load heterogeneous-instance results (optional)
+    # Heterogeneous-instance results
     hetero_csv   = joinpath(results_dir, "results_hetero.csv")
     hetero_d_csv = joinpath(results_dir, "results_hetero_density.csv")
     hetero_s_csv = joinpath(results_dir, "results_hetero_ss.csv")
-
-    hetero_base = Dict{Tuple{String,String}, Vector{Float64}}()
-    hetero_dens = Dict{Tuple{String,String}, Vector{Float64}}()
-    hetero_ss   = Dict{Tuple{String,String}, Vector{Float64}}()
-
-    if isfile(hetero_csv)
+    memetic_hetero_csv   = joinpath(results_dir, "memetic_benchmark_3lpdp_h.csv")
+    memetic_hetero_d_csv = joinpath(results_dir, "memetic_benchmark_3lpdp_d_h.csv")
+    memetic_hetero_c_csv = joinpath(results_dir, "memetic_benchmark_3lpdp_c.csv")
+    hetero_base     = Dict{Tuple{String,String}, Vector{Float64}}()
+    hetero_dens     = Dict{Tuple{String,String}, Vector{Float64}}()
+    hetero_ss       = Dict{Tuple{String,String}, Vector{Float64}}()
+    hetero_base_vol = Dict{Tuple{String,String}, Vector{Float64}}()
+    hetero_dens_vol = Dict{Tuple{String,String}, Vector{Float64}}()
+    hetero_ss_vol   = Dict{Tuple{String,String}, Vector{Float64}}()
+    if isfile(memetic_hetero_csv)
+        println("Loading memetic hetero baseline from $memetic_hetero_csv ...")
+        hetero_base, _, hetero_base_vol = load_memetic_csv(memetic_hetero_csv, "3lpdp_h")
+        println("  $(sum(length(v) for v in values(hetero_base))) memetic hetero baseline run records")
+    elseif isfile(hetero_csv)
         println("Loading hetero baseline from $hetero_csv ...")
-        hetero_base, _, _ = load_csv(hetero_csv)
+        hetero_base, _, hetero_base_vol = load_csv(hetero_csv)
         println("  $(sum(length(v) for v in values(hetero_base))) hetero baseline run records")
     end
-    if isfile(hetero_d_csv)
+    if isfile(memetic_hetero_d_csv)
+        println("Loading memetic hetero density from $memetic_hetero_d_csv ...")
+        hetero_dens, _, hetero_dens_vol = load_memetic_csv(memetic_hetero_d_csv, "3lpdp_d")
+        println("  $(sum(length(v) for v in values(hetero_dens))) memetic hetero density run records")
+    elseif isfile(hetero_d_csv)
         println("Loading hetero density from $hetero_d_csv ...")
-        hetero_dens, _, _ = load_csv(hetero_d_csv)
+        hetero_dens, _, hetero_dens_vol = load_csv(hetero_d_csv)
         println("  $(sum(length(v) for v in values(hetero_dens))) hetero density run records")
     end
-    if isfile(hetero_s_csv)
+    if isfile(memetic_hetero_c_csv)
+        println("Loading memetic hetero combined structural from $memetic_hetero_c_csv ...")
+        hetero_ss, _, hetero_ss_vol = load_memetic_csv(memetic_hetero_c_csv, "3lpdp_c")
+        println("  $(sum(length(v) for v in values(hetero_ss))) memetic hetero combined structural run records")
+    elseif isfile(hetero_s_csv)
         println("Loading hetero SS from $hetero_s_csv ...")
-        hetero_ss, _, _ = load_csv(hetero_s_csv)
+        hetero_ss, _, hetero_ss_vol = load_csv(hetero_s_csv)
         println("  $(sum(length(v) for v in values(hetero_ss))) hetero SS run records")
     end
     println()
 
-    println("Generating main tables ...")
-    write_summary(results, dens_res, ss_res, times, summary_out)
-    write_detailed(results, dens_res, ss_res, detailed_out)
-    # write_density_comparison(results, dens_res, density_out)  # table removed from §5.8
+    mb_inst_dir     = joinpath(@__DIR__, "..", "3L_PDP_instances")
+    hetero_inst_dir = joinpath(@__DIR__, "..", "3L_PDP_instances_hetero")
+    mb_density_cv     = density_cv_from_dir(mb_inst_dir)
+    hetero_density_cv = density_cv_from_dir(hetero_inst_dir)
+    if !isnan(mb_density_cv)
+        @printf("M&B density CV (σ/μ): %.2f\n", mb_density_cv)
+    end
+    if !isnan(hetero_density_cv)
+        @printf("Hetero density CV (σ/μ): %.2f\n", hetero_density_cv)
+    end
+    println()
 
-    if isfile(hetero_csv) || isfile(hetero_d_csv) || isfile(hetero_s_csv)
+    println("Generating main tables ...")
+    dv4_stats = delta_v4_stats(results)
+    if !isnan(dv4_stats.inst_mean)
+        @printf("  ΔV4 mean=%+.2f%%  95%% CI ±%.2f%% (instance-level, n=%d)\n",
+                dv4_stats.inst_mean, dv4_stats.inst_ci_hw, dv4_stats.n_inst)
+    end
+    write_summary(results, dens_res, ss_res, times, summary_out)
+    write_detailed(results, dens_res, ss_res,
+                   res_vol, dens_vol, ss_vol, mb_vol_pct,
+                   detailed_out; mb_density_cv=mb_density_cv, dv4_stats=dv4_stats)
+
+    if isfile(memetic_hetero_csv) || isfile(memetic_hetero_d_csv) || isfile(memetic_hetero_c_csv) ||
+       isfile(hetero_csv) || isfile(hetero_d_csv) || isfile(hetero_s_csv)
         println("Generating hetero table ...")
-        write_hetero_summary(hetero_base, hetero_dens, hetero_ss, hetero_out)
+        write_hetero_summary(hetero_base, hetero_dens, hetero_ss,
+                             hetero_base_vol, hetero_dens_vol, hetero_ss_vol,
+                             hetero_out; hetero_density_cv=hetero_density_cv)
     else
         println("  Note: no hetero results found — skipping results_hetero.tex")
     end
@@ -644,4 +909,6 @@ function main()
     println("\nDone.")
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

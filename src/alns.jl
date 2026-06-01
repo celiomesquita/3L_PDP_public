@@ -39,6 +39,11 @@ include("packing.jl")
 
 const K_CHECK = 20   # parallel batch size for packing checks in repair_topk!
 
+function _alns_destroy_count(n_total::Int)::Int
+    n_total <= 0 && return 0
+    return Int(get_number_to_destroy(n_total, settings, 5.0, 0.1, 100.0, 0.5))
+end
+
 # ── solution type ─────────────────────────────────────────────────────────────
 """
     PDPSolution
@@ -75,7 +80,7 @@ MHLib.obj(sol::PDPSolution) = sol.obj_val
 MHLib.is_better(a::PDPSolution, b::PDPSolution) = a.obj_val < b.obj_val
 
 function MHLib.calc_objective(sol::PDPSolution)
-    sol.obj_val = _travel_cost(sol)
+    sol.obj_val = packing_feasible(sol) ? _travel_cost(sol) : Inf
 end
 
 function Base.copy!(dst::PDPSolution, src::PDPSolution)
@@ -177,6 +182,13 @@ end
 
 Build an initial solution by round-robin assignment sorted by pickup distance,
 using the paired (immediate-delivery) order p_r → d_r within each vehicle.
+
+Hard requests — those whose single-request route fails the packing check
+(typically because their 1C-SP depth exceeds the vehicle length and they
+require a 2C-SP or 3C-SP merging partner) — are re-inserted after the
+initial round-robin using an interleaved search over all non-empty vehicles.
+Vehicles are sparse at construction time, so a compatible neighbor is
+usually available.
 """
 function construct!(sol::PDPSolution, par::Int, result::Result)
     inst = sol.inst
@@ -209,7 +221,7 @@ element appended to sol.routes for retrieval by the repair operator.
 """
 function destroy_random!(sol::PDPSolution, par::Int, result::Result)
     n_total   = sum(length(r) for r in sol.routes) ÷ 2  # number of requests
-    n_destroy = get_number_to_destroy(n_total)
+    n_destroy = _alns_destroy_count(n_total)
     n_destroy == 0 && return
 
     removed = Int[]
@@ -240,7 +252,7 @@ Savings are approximated by the cost of the two-node detour (pickup + delivery).
 """
 function destroy_worst!(sol::PDPSolution, par::Int, result::Result)
     n_total   = sum(length(r) for r in sol.routes) ÷ 2
-    n_destroy = get_number_to_destroy(n_total)
+    n_destroy = _alns_destroy_count(n_total)
     n_destroy == 0 && return
 
     dist = sol.dist
@@ -305,7 +317,7 @@ already-removed request, with randomness parameter φ = 3.
 """
 function destroy_shaw!(sol::PDPSolution, par::Int, result::Result)
     n_total   = sum(length(r) for r in sol.routes) ÷ 2
-    n_destroy = get_number_to_destroy(n_total)
+    n_destroy = _alns_destroy_count(n_total)
     n_destroy == 0 && return
 
     dist = sol.dist
@@ -831,7 +843,7 @@ different route structures, particularly effective on clustered instances.
 """
 function destroy_tour!(sol::PDPSolution, par::Int, result::Result)
     n_total   = sum(length(r) for r in sol.routes) ÷ 2
-    n_destroy = get_number_to_destroy(n_total)
+    n_destroy = _alns_destroy_count(n_total)
     n_destroy == 0 && return
 
     eligible = [k for k in eachindex(sol.routes) if !isempty(sol.routes[k])]
@@ -936,7 +948,7 @@ function _or_opt_between_routes!(sol::PDPSolution)
                     end
                 end
 
-                if best_k2 >= 0
+                if best_k2 >= 0 && _route_packing_ok(stripped1, sol.inst)
                     sol.routes[k1]    = stripped1
                     sol.routes[best_k2] = best_r2
                     route1   = sol.routes[k1]
@@ -958,12 +970,15 @@ end
 
 Run ALNS on a 3L-PDP instance using MHLib and print the best solution found.
 """
-function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1)
+function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1,
+                    full_reset_after::Int = 8,
+                    return_solution::Bool = false,
+                    verbose::Bool = true)
     seed >= 0 && Random.seed!(seed)
 
     n = n_requests(inst)
     K = inst.max_routes
-    println("Building ALNS  |  n=$n  K=$K  time_limit=$(time_limit)s")
+    verbose && println("Building ALNS  |  n=$n  K=$K  time_limit=$(time_limit)s")
 
     BURST_TIME  = 15.0   # wall-clock seconds per ALNS burst
     BASE_RATIO  = 0.40   # base Shaw perturbation fraction on rejection
@@ -979,7 +994,9 @@ function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1)
     META_TEMP_FACTOR = 0.02    # meta_temp = obj(init) * 0.02
     META_COOLING     = 0.85    # multiplicative cooling per burst
 
-    MAX_BURSTS_NO_GLOBAL = 8   # early-stop after this many bursts with no global improvement
+    # Early-stop after this many ALNS bursts without improving the global best.
+    # Kept as a keyword because src/main.jl exposes it as the sixth CLI argument.
+    MAX_BURSTS_NO_GLOBAL = max(1, full_reset_after)
 
     # ── initial solution ───────────────────────────────────────────────────────
     init_sol = PDPSolution(inst)
@@ -1001,8 +1018,7 @@ function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1)
 
         ttime = Int(floor(burst_secs))
         MHLib.parse_settings!(MHLib.all_settings_cfgs,
-            ["--mh_titer=-1", "--mh_ttime=$ttime",
-             "--mh_alns_dest_max_ratio=0.5"])
+            ["--mh_titer=-1", "--mh_ttime=$ttime"])
 
         # Seed each burst from current_sol
         start   = copy(current_sol)
@@ -1030,14 +1046,15 @@ function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1)
             _improve_delivery_order!(best_sol)
             _or_opt_between_routes!(best_sol)
             bursts_no_global = 0
-            @printf "  burst: new best=%.4f  (meta_T=%.2f)\n" obj(best_sol) meta_temp
+            feas_tag = packing_feasible(best_sol) ? "  *** FEASIBLE ***" : ""
+            verbose && @printf "  burst: t=%6.1fs  new best=%12.4f%s\n" (time()-t0) obj(best_sol) feas_tag
         else
             bursts_no_global += 1
         end
 
         # Early stop if consistently no global improvement
         if bursts_no_global >= MAX_BURSTS_NO_GLOBAL
-            @printf "  → early stop: %d bursts with no global improvement (best=%.4f)\n" bursts_no_global obj(best_sol)
+            verbose && @printf "  → early stop: %d bursts with no global improvement (best=%.4f)\n" bursts_no_global obj(best_sol)
             break
         end
 
@@ -1046,14 +1063,14 @@ function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1)
         if delta <= 0.0 || rand() <= exp(-delta / max(meta_temp, 1e-9))
             # Accept burst result (improving or SA-accepted worsening)
             current_sol = copy(burst_best)
-            delta > 0 && @printf "  burst: SA accept  sol=%.4f  Δ=+%.2f  T=%.2f\n" obj(burst_best) delta meta_temp
+            verbose && delta > 0 && @printf "  burst: SA accept  sol=%.4f  Δ=+%.2f  T=%.2f\n" obj(burst_best) delta meta_temp
         else
             # Reject: perturb from global best and escalate diversity
             n_restarts += 1
             current_sol = copy(best_sol)
             ratio = min(MAX_RATIO, BASE_RATIO + 0.10 * (n_restarts - 1))
             _large_shaw_perturbation!(current_sol, ratio)
-            @printf "  burst: SA reject  restart #%d  shaw %.0f%%  T=%.2f\n" n_restarts (ratio*100) meta_temp
+            verbose && @printf "  burst: SA reject  restart #%d  shaw %.0f%%  T=%.2f\n" n_restarts (ratio*100) meta_temp
         end
 
         meta_temp *= META_COOLING
@@ -1062,10 +1079,13 @@ function solve_alns(inst::Instance; time_limit::Float64 = 300.0, seed::Int = -1)
     total_time = time() - t0
     n_calls, n_feasible = get_pack_counts()
     pce = n_calls > 0 ? round(n_feasible / n_calls; digits=4) : 0.0
-    println("\nALNS finished  ($(n_restarts) rejections,  $(round(total_time; digits=1))s)")
-    println("Best objective : $(round(obj(best_sol); digits=4))")
-    println("Pack calls: $n_calls  feasible: $n_feasible  PCE: $pce")
-    _print_alns_solution(best_sol)
+    if verbose
+        println("\nALNS finished  ($(n_restarts) rejections,  $(round(total_time; digits=1))s)")
+        println("Best objective : $(round(obj(best_sol); digits=4))")
+        println("Pack calls: $n_calls  feasible: $n_feasible  PCE: $pce")
+        _print_alns_solution(best_sol)
+    end
+    return_solution && return obj(best_sol), total_time, n_calls, n_feasible, copy(best_sol)
     return obj(best_sol), total_time, n_calls, n_feasible
 end
 
