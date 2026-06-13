@@ -24,7 +24,7 @@
 # Solve time ~200 s on Intel Xeon E3-1225 v6 / 32 GiB / HiGHS 1.13.1.
 # Optimal objective: 258.28 (all 4 requests on one vehicle, LIFO binding).
 #
-# Constraint labels match the manuscript problem formulation (PC1–PC7).
+# Constraint labels reference the paper (latex/sections/03_problem_formulation.tex).
 
 using JuMP
 using HiGHS

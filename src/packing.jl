@@ -17,7 +17,20 @@
 #
 # ── Packing constraints ────────────────────────────────────────────────────────
 #   PC1 – fixed orientation (no rotation attempted)
-#   PC2 – vertical stability (shelf packing gives full base support)
+#   PC2 – vertical stability (shelf packing gives full base support); deactivated when
+#        _USE_COG_SP[] is true — then CoG–SP replaces PC2 (see docs/packing_oracle_cog_sp_design.md)
+@isdefined(_USE_COG_SP) || const _USE_COG_SP = Ref{Bool}(false)
+
+include(joinpath(@__DIR__, "packing_cog_sp.jl"))
+
+"""Cross-section pack: shelf-FFD (PC2) or CoG--SP when `_USE_COG_SP[]`."""
+function _pack_cross_section(boxes::AbstractVector{Box}, Wv::Int, Hv::Int)::Int
+    if _USE_COG_SP[]
+        h, _ = _pack_2d_height_cog(boxes, Wv, Hv)
+        return h == typemax(Int) ? _PACK_INF : h
+    end
+    return _pack_2d_height(boxes, Wv, Hv)
+end
 #   PC3 – fragility (fragile boxes placed on the topmost shelf; nothing above)
 #   PC4 – LIFO (each request occupies a contiguous a-segment;
 #              delivery order equals segment order from door inward)
@@ -181,14 +194,14 @@ function _make_layers(boxes::AbstractVector{Box},
             depth_i, layer_boxes = layers[i]
             b.l > depth_i && continue        # box too long for this layer's slab
             candidate = vcat(layer_boxes, [b])
-            if _pack_2d_height(candidate, Wv, Hv) < _PACK_INF
+            if _pack_cross_section(candidate, Wv, Hv) < _PACK_INF
                 layers[i] = (depth_i, candidate)
                 placed = true
                 break
             end
         end
         if !placed
-            _pack_2d_height([b], Wv, Hv) == _PACK_INF && return Tuple{Int,Vector{Box}}[]
+            _pack_cross_section([b], Wv, Hv) == _PACK_INF && return Tuple{Int,Vector{Box}}[]
             push!(layers, (b.l, [b]))
         end
     end
@@ -206,7 +219,7 @@ function _make_layers(boxes::AbstractVector{Box},
         absorbed = false
         for j in 1:i-1
             depth_j, boxes_j = layers[j]
-            if _pack_2d_height(vcat(boxes_j, boxes_i), Wv, Hv) < _PACK_INF
+            if _pack_cross_section(vcat(boxes_j, boxes_i), Wv, Hv) < _PACK_INF
                 layers[j] = (depth_j, vcat(boxes_j, boxes_i))
                 deleteat!(layers, i)
                 absorbed = true
@@ -244,13 +257,13 @@ Attempt to reduce the combined a-depth of the adjacent pair (`r_near`,
 `r_far` into a single cross-section slab (two-compartment segment pattern,
 2C-SP).
 
-LIFO compatibility (PC4) and vertical stability (PC2) are maintained by
+LIFO compatibility (PC4) and vertical stability (PC2 when !_USE_COG_SP[]) are maintained by
 vertical separation: `r_far`'s boxes occupy the lower zone of the merged
 cross-section (height h_far, resting on the vehicle floor), and `r_near`'s
 boxes are packed into the upper zone (height h_near, above r_far), with
 h_far + h_near ≤ Hv.  Placing the first-to-deliver request on top guarantees
 that its items can be lifted out without displacing r_far's items (PC4), and
-r_far remains floor-supported throughout loading and unloading (PC2).
+r_far remains floor-supported throughout loading and unloading (PC2 when !_USE_COG_SP[]).
 
 Returns `min(d_1csp_near + d_1csp_far, d_2csp)`, or `_PACK_INF` if either
 request is individually infeasible.
@@ -271,10 +284,10 @@ function _depth_2csp(r_near::Request, r_far::Request, Wv::Int, Hv::Int)::Int
     _, boxes_last  = layers_near[end]
     d_first, boxes_first = layers_far[1]
 
-    # Vertical-separation feasibility check: r_far on floor, r_near on top (PC2 + PC4)
-    h_far  = _pack_2d_height(boxes_first, Wv, Hv)
+    # Vertical-separation feasibility check: r_far on floor, r_near on top (PC4; PC2 if !_USE_COG_SP[])
+    h_far  = _pack_cross_section(boxes_first, Wv, Hv)
     h_far  == _PACK_INF && return d_1c
-    h_near = _pack_2d_height(boxes_last,  Wv, Hv - h_far)
+    h_near = _pack_cross_section(boxes_last,  Wv, Hv - h_far)
     h_near == _PACK_INF && return d_1c
 
     merged_depth = max(layers_near[end][1], d_first)
@@ -327,11 +340,11 @@ function _depth_3csp(r_near::Request, r_mid::Request, r_far::Request,
     boxes_mid_all     = reduce(vcat, [b for (_, b) in layers_mid])
 
     # Vertical feasibility: r_far on floor, r_mid above, r_near on top
-    h_far  = _pack_2d_height(boxes_far_bnd,  Wv, Hv)
+    h_far  = _pack_cross_section(boxes_far_bnd,  Wv, Hv)
     h_far  == _PACK_INF && return d_1c
-    h_mid  = _pack_2d_height(boxes_mid_all,  Wv, Hv - h_far)
+    h_mid  = _pack_cross_section(boxes_mid_all,  Wv, Hv - h_far)
     h_mid  == _PACK_INF && return d_1c
-    h_near = _pack_2d_height(boxes_near_bnd, Wv, Hv - h_far - h_mid)
+    h_near = _pack_cross_section(boxes_near_bnd, Wv, Hv - h_far - h_mid)
     h_near == _PACK_INF && return d_1c
 
     merged_depth = max(layers_near[end][1],
